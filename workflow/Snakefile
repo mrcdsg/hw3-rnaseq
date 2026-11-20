@@ -1,0 +1,351 @@
+import csv
+
+configfile: "config/config.yaml"
+
+with open(config["samples"]) as fh:
+    SAMPLES = [row["sample"] for row in csv.DictReader(fh, delimiter="\t")]
+
+REF = config["reference"]
+T = config["threads"]
+STRAND = int(config["featurecounts"]["strandedness"])
+KALLISTO_STRAND = {0: "", 1: "--fr-stranded", 2: "--rf-stranded"}[STRAND]
+
+wildcard_constraints:
+    sample = "|".join(SAMPLES),
+    read = "1|2"
+
+localrules: all
+rule all:
+    input:
+        "results/multiqc/multiqc_report.html",
+        "results/counts/featureCounts.txt",
+        expand("results/kallisto/{sample}/abundance.tsv", sample=SAMPLES),
+        "results/deeptools/correlation_heatmap.png",
+        "results/deeptools/pca.png",
+        "results/deeptools/fragment_size.png",
+        "results/rseqc/genebody/all.geneBodyCoverage.txt",
+
+rule download_fastq:
+    output:
+        r1 = "data/raw/{sample}_1.fastq.gz",
+        r2 = "data/raw/{sample}_2.fastq.gz",
+    log: "logs/download/{sample}.log"
+    conda: "envs/sra.yaml"
+    threads: T["default"]
+    resources: mem_mb = 8000, runtime = 240
+    params: tmp = "data/tmp/{sample}"
+    shell:
+        """
+        mkdir -p {params.tmp}
+        prefetch {wildcards.sample} --max-size 100G -O {params.tmp} > {log} 2>&1
+        fasterq-dump {params.tmp}/{wildcards.sample} --split-files -e {threads} \
+            -t {params.tmp} -O {params.tmp} >> {log} 2>&1
+        pigz -p {threads} -c {params.tmp}/{wildcards.sample}_1.fastq > {output.r1}
+        pigz -p {threads} -c {params.tmp}/{wildcards.sample}_2.fastq > {output.r2}
+        rm -rf {params.tmp}
+        """
+
+rule fastqc_raw:
+    input: "data/raw/{sample}_{read}.fastq.gz"
+    output:
+        html = "results/qc/fastqc_raw/{sample}_{read}_fastqc.html",
+        zip = "results/qc/fastqc_raw/{sample}_{read}_fastqc.zip",
+    log: "logs/fastqc_raw/{sample}_{read}.log"
+    conda: "envs/qc.yaml"
+    threads: 2
+    resources: mem_mb = 4000, runtime = 60
+    shell: "fastqc -t {threads} -o results/qc/fastqc_raw {input} > {log} 2>&1"
+
+rule fastp:
+    input:
+        r1 = "data/raw/{sample}_1.fastq.gz",
+        r2 = "data/raw/{sample}_2.fastq.gz",
+    output:
+        r1 = "results/trimmed/{sample}_1.trimmed.fastq.gz",
+        r2 = "results/trimmed/{sample}_2.trimmed.fastq.gz",
+        json = "results/qc/fastp/{sample}.fastp.json",
+        html = "results/qc/fastp/{sample}.fastp.html",
+    log: "logs/fastp/{sample}.log"
+    conda: "envs/qc.yaml"
+    threads: T["default"]
+    resources: mem_mb = 8000, runtime = 120
+    params:
+        q = config["fastp"]["qualified_quality"],
+        l = config["fastp"]["length_required"],
+    shell:
+        """
+        fastp -i {input.r1} -I {input.r2} -o {output.r1} -O {output.r2} \
+              --detect_adapter_for_pe --qualified_quality_phred {params.q} \
+              --length_required {params.l} --thread {threads} \
+              --json {output.json} --html {output.html} > {log} 2>&1
+        """
+
+rule fastqc_trimmed:
+    input: "results/trimmed/{sample}_{read}.trimmed.fastq.gz"
+    output:
+        html = "results/qc/fastqc_trimmed/{sample}_{read}.trimmed_fastqc.html",
+        zip = "results/qc/fastqc_trimmed/{sample}_{read}.trimmed_fastqc.zip",
+    log: "logs/fastqc_trimmed/{sample}_{read}.log"
+    conda: "envs/qc.yaml"
+    threads: 2
+    resources: mem_mb = 4000, runtime = 60
+    shell: "fastqc -t {threads} -o results/qc/fastqc_trimmed {input} > {log} 2>&1"
+
+rule hisat2_index:
+    input: ancient(REF["genome"])
+    output: multiext(f"{REF['dir']}/hisat2_index/genome", *[f".{i}.ht2" for i in range(1, 9)])
+    log: "logs/hisat2_index/hisat2_index.log"
+    conda: "envs/hisat2.yaml"
+    threads: T["hisat2_index"]
+    resources: mem_mb = 32000, runtime = 480
+    params: prefix = f"{REF['dir']}/hisat2_index/genome"
+    shell: "hisat2-build -p {threads} {input} {params.prefix} > {log} 2>&1"
+
+rule hisat2_align:
+    input:
+        r1 = "results/trimmed/{sample}_1.trimmed.fastq.gz",
+        r2 = "results/trimmed/{sample}_2.trimmed.fastq.gz",
+        idx = rules.hisat2_index.output,
+    output:
+        bam = "results/aligned/{sample}.bam",
+        bai = "results/aligned/{sample}.bam.bai",
+    log: "logs/hisat2/{sample}.log"
+    conda: "envs/hisat2.yaml"
+    threads: T["hisat2"]
+    resources: mem_mb = 16000, runtime = 360
+    params:
+        prefix = f"{REF['dir']}/hisat2_index/genome",
+        extra = config["hisat2"]["extra"],
+    shell:
+        """
+        hisat2 -p {threads} -x {params.prefix} -1 {input.r1} -2 {input.r2} {params.extra} 2> {log} \
+            | samtools sort -@ {threads} -m 1G -o {output.bam} -
+        samtools index {output.bam}
+        """
+
+rule samtools_stats:
+    input: "results/aligned/{sample}.bam"
+    output:
+        flagstat = "results/qc/samtools/{sample}.flagstat.txt",
+        stats = "results/qc/samtools/{sample}.stats.txt",
+    log: "logs/samtools/{sample}.log"
+    conda: "envs/hisat2.yaml"
+    threads: 2
+    resources: mem_mb = 4000, runtime = 60
+    shell:
+        """
+        samtools flagstat -@ {threads} {input} > {output.flagstat} 2> {log}
+        samtools stats -@ {threads} {input} > {output.stats} 2>> {log}
+        """
+
+rule featurecounts:
+    input:
+        bams = expand("results/aligned/{sample}.bam", sample=SAMPLES),
+        gtf = ancient(REF["gtf"]),
+    output:
+        table = "results/counts/featureCounts.txt",
+        summary = "results/counts/featureCounts.txt.summary",
+    log: "logs/featurecounts/featurecounts.log"
+    conda: "envs/subread.yaml"
+    threads: T["default"]
+    resources: mem_mb = 8000, runtime = 120
+    params:
+        s = STRAND,
+        t = config["featurecounts"]["feature_type"],
+        g = config["featurecounts"]["attribute"],
+    shell:
+        """
+        featureCounts -T {threads} -p --countReadPairs -s {params.s} \
+            -t {params.t} -g {params.g} -a {input.gtf} \
+            -o {output.table} {input.bams} > {log} 2>&1
+        """
+rule kallisto_index:
+    input: ancient(REF["transcripts"])
+    output: f"{REF['dir']}/kallisto/transcripts.idx"
+    log: "logs/kallisto_index/kallisto_index.log"
+    conda: "envs/kallisto.yaml"
+    threads: T["kallisto_index"]
+    resources: mem_mb = 32000, runtime = 240
+    shell: "kallisto index -t {threads} -i {output} {input} > {log} 2>&1"
+
+rule kallisto_quant:
+    input:
+        r1 = "results/trimmed/{sample}_1.trimmed.fastq.gz",
+        r2 = "results/trimmed/{sample}_2.trimmed.fastq.gz",
+        idx = rules.kallisto_index.output,
+    output:
+        abundance = "results/kallisto/{sample}/abundance.tsv",
+        info = "results/kallisto/{sample}/run_info.json",
+    log: "logs/kallisto/{sample}.log"
+    conda: "envs/kallisto.yaml"
+    threads: T["kallisto"]
+    resources: mem_mb = 16000, runtime = 120
+    params:
+        b = config["kallisto"]["bootstraps"],
+        strand = KALLISTO_STRAND,
+    shell:
+        """
+        kallisto quant -i {input.idx} -o results/kallisto/{wildcards.sample} \
+            -b {params.b} -t {threads} {params.strand} {input.r1} {input.r2} > {log} 2>&1
+        """
+rule gtf_to_bed:
+    input: ancient(REF["gtf"])
+    output:
+        bed = f"{REF['dir']}/annotation.bed12",
+        canonical = f"{REF['dir']}/annotation.canonical_pc.bed12",
+    log: "logs/gtf_to_bed/gtf_to_bed.log"
+    conda: "envs/rseqc.yaml"
+    resources: mem_mb = 8000, runtime = 60
+    params: tmp = f"{REF['dir']}/tmp_genepred"
+    shell:
+        """
+        mkdir -p {params.tmp}
+        gtfToGenePred -genePredExt {input} {params.tmp}/all.gp 2> {log}
+        genePredToBed {params.tmp}/all.gp {output.bed} 2>> {log}
+        grep 'tag "Ensembl_canonical"' {input} | grep 'transcript_type "protein_coding"' \
+            > {params.tmp}/canonical.gtf
+        gtfToGenePred -genePredExt {params.tmp}/canonical.gtf {params.tmp}/canonical.gp 2>> {log}
+        genePredToBed {params.tmp}/canonical.gp {output.canonical} 2>> {log}
+        rm -rf {params.tmp}
+        """
+
+rule rseqc_bam_stat:
+    input: "results/aligned/{sample}.bam"
+    output: "results/rseqc/{sample}.bam_stat.txt"
+    log: "logs/rseqc/{sample}.bam_stat.log"
+    conda: "envs/rseqc.yaml"
+    resources: mem_mb = 4000, runtime = 120
+    shell: "bam_stat.py -i {input} > {output} 2> {log}"
+
+rule rseqc_infer_experiment:
+    input:
+        bam = "results/aligned/{sample}.bam",
+        bed = rules.gtf_to_bed.output.bed,
+    output: "results/rseqc/{sample}.infer_experiment.txt"
+    log: "logs/rseqc/{sample}.infer_experiment.log"
+    conda: "envs/rseqc.yaml"
+    resources: mem_mb = 4000, runtime = 60
+    shell: "infer_experiment.py -i {input.bam} -r {input.bed} > {output} 2> {log}"
+
+rule rseqc_read_distribution:
+    input:
+        bam = "results/aligned/{sample}.bam",
+        bed = rules.gtf_to_bed.output.bed,
+    output: "results/rseqc/{sample}.read_distribution.txt"
+    log: "logs/rseqc/{sample}.read_distribution.log"
+    conda: "envs/rseqc.yaml"
+    resources: mem_mb = 8000, runtime = 240
+    shell: "read_distribution.py -i {input.bam} -r {input.bed} > {output} 2> {log}"
+
+rule rseqc_inner_distance:
+    input:
+        bam = "results/aligned/{sample}.bam",
+        bed = rules.gtf_to_bed.output.bed,
+    output:
+        freq = "results/rseqc/{sample}.inner_distance_freq.txt",
+        summary = "results/rseqc/{sample}.inner_distance_summary.txt",
+    log: "logs/rseqc/{sample}.inner_distance.log"
+    conda: "envs/rseqc.yaml"
+    resources: mem_mb = 4000, runtime = 120
+    params: prefix = "results/rseqc/{sample}"
+    shell: "inner_distance.py -i {input.bam} -r {input.bed} -o {params.prefix} > {output.summary} 2> {log}"
+
+rule rseqc_genebody_coverage:
+    input:
+        bams = expand("results/aligned/{sample}.bam", sample=SAMPLES),
+        bais = expand("results/aligned/{sample}.bam.bai", sample=SAMPLES),
+        bed = rules.gtf_to_bed.output.canonical,
+    output:
+        txt = "results/rseqc/genebody/all.geneBodyCoverage.txt",
+        pdf = "results/rseqc/genebody/all.geneBodyCoverage.curves.pdf",
+    log: "logs/rseqc/genebody_coverage.log"
+    conda: "envs/rseqc.yaml"
+    resources: mem_mb = 8000, runtime = 1440
+    params:
+        bams = lambda wc, input: ",".join(input.bams),
+        prefix = "results/rseqc/genebody/all",
+    shell: "geneBody_coverage.py -i {params.bams} -r {input.bed} -o {params.prefix} > {log} 2>&1"
+
+rule deeptools_multibamsummary:
+    input:
+        bams = expand("results/aligned/{sample}.bam", sample=SAMPLES),
+        bais = expand("results/aligned/{sample}.bam.bai", sample=SAMPLES),
+    output:
+        npz = "results/deeptools/bins.npz",
+        counts = "results/deeptools/bins_counts.tab",
+    log: "logs/deeptools/multibamsummary.log"
+    conda: "envs/deeptools.yaml"
+    threads: T["default"]
+    resources: mem_mb = 16000, runtime = 240
+    params:
+        bin_size = config["deeptools"]["bin_size"],
+        labels = SAMPLES,
+    shell:
+        """
+        multiBamSummary bins --bamfiles {input.bams} --labels {params.labels} \
+            --binSize {params.bin_size} -p {threads} \
+            -o {output.npz} --outRawCounts {output.counts} > {log} 2>&1
+        """
+
+rule deeptools_correlation:
+    input: rules.deeptools_multibamsummary.output.npz
+    output:
+        png = "results/deeptools/correlation_heatmap.png",
+        matrix = "results/deeptools/correlation_matrix.tab",
+    log: "logs/deeptools/plotcorrelation.log"
+    conda: "envs/deeptools.yaml"
+    resources: mem_mb = 4000, runtime = 30
+    shell:
+        """
+        plotCorrelation -in {input} --corMethod spearman --whatToPlot heatmap \
+            --skipZeros --plotNumbers --removeOutliers \
+            -o {output.png} --outFileCorMatrix {output.matrix} > {log} 2>&1
+        """
+
+rule deeptools_pca:
+    input: rules.deeptools_multibamsummary.output.npz
+    output:
+        png = "results/deeptools/pca.png",
+        data = "results/deeptools/pca_data.tab",
+    log: "logs/deeptools/plotpca.log"
+    conda: "envs/deeptools.yaml"
+    resources: mem_mb = 4000, runtime = 30
+    shell: "plotPCA -in {input} -o {output.png} --outFileNameData {output.data} > {log} 2>&1"
+
+rule deeptools_fragment_size:
+    input:
+        bams = expand("results/aligned/{sample}.bam", sample=SAMPLES),
+        bais = expand("results/aligned/{sample}.bam.bai", sample=SAMPLES),
+    output:
+        png = "results/deeptools/fragment_size.png",
+        table = "results/deeptools/fragment_size.tab",
+    log: "logs/deeptools/bampefragmentsize.log"
+    conda: "envs/deeptools.yaml"
+    threads: T["default"]
+    resources: mem_mb = 8000, runtime = 120
+    params: labels = SAMPLES
+    shell:
+        """
+        bamPEFragmentSize -b {input.bams} --samplesLabel {params.labels} -p {threads} \
+            --histogram {output.png} --table {output.table} > {log} 2>&1
+        """
+
+rule multiqc:
+    input:
+        expand("results/qc/fastqc_raw/{sample}_{read}_fastqc.zip", sample=SAMPLES, read=[1, 2]),
+        expand("results/qc/fastqc_trimmed/{sample}_{read}.trimmed_fastqc.zip", sample=SAMPLES, read=[1, 2]),
+        expand("results/qc/fastp/{sample}.fastp.json", sample=SAMPLES),
+        expand("results/qc/samtools/{sample}.stats.txt", sample=SAMPLES),
+        expand("results/rseqc/{sample}.{kind}.txt", sample=SAMPLES,
+               kind=["bam_stat", "infer_experiment", "read_distribution", "inner_distance_freq"]),
+        "results/rseqc/genebody/all.geneBodyCoverage.txt",
+        "results/counts/featureCounts.txt.summary",
+        expand("results/kallisto/{sample}/abundance.tsv", sample=SAMPLES),
+        "results/deeptools/correlation_matrix.tab",
+        "results/deeptools/pca_data.tab",
+        "results/deeptools/fragment_size.tab",
+    output: "results/multiqc/multiqc_report.html"
+    log: "logs/multiqc/multiqc.log"
+    conda: "envs/multiqc.yaml"
+    resources: mem_mb = 8000, runtime = 60
+    shell: "multiqc -f -o results/multiqc results logs > {log} 2>&1"
