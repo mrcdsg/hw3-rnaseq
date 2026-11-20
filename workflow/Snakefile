@@ -38,7 +38,7 @@ rule download_fastq:
         """
         mkdir -p {params.tmp}
         prefetch {wildcards.sample} --max-size 100G -O {params.tmp} > {log} 2>&1
-        fasterq-dump {params.tmp}/{wildcards.sample} --split-files -e {threads} \
+        fasterq-dump {params.tmp}/{wildcards.sample} --split-3 -e {threads} \
             -t {params.tmp} -O {params.tmp} >> {log} 2>&1
         pigz -p {threads} -c {params.tmp}/{wildcards.sample}_1.fastq > {output.r1}
         pigz -p {threads} -c {params.tmp}/{wildcards.sample}_2.fastq > {output.r2}
