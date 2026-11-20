@@ -1,0 +1,33 @@
+# HW3 workflow konfigūracija
+
+samples: "config/samples.tsv"      
+
+reference:
+  dir: "reference"
+  genome: "reference/GRCh38.primary_assembly.genome.fa"
+  gtf: "reference/gencode.v48.primary_assembly.annotation.gtf"
+  transcripts: "reference/gencode.v48.transcripts.fa"
+
+fastp:
+  qualified_quality: 20            
+  length_required: 30              
+
+hisat2:
+  extra: ""                        
+
+featurecounts:
+  strandedness: 0                  
+  feature_type: "exon"             
+  attribute: "gene_id"             
+
+kallisto:
+  bootstraps: 0
+
+deeptools:
+  bin_size: 10000                  
+threads:
+  default: 4
+  hisat2_index: 8
+  hisat2: 8
+  kallisto_index: 4
+  kallisto: 4
