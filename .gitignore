@@ -1,0 +1,10 @@
+data/
+reference/
+results/
+logs/
+.snakemake/
+*.bam
+*.bai
+*.sam
+*.fastq*
+*.fq*
