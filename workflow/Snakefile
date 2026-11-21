@@ -1,3 +1,7 @@
+# HW3: žmogaus RNA-seq pirminio apdorojimo Snakemake workflow.
+# Paleidimas iš projekto šaknies:  snakemake --profile profiles/slurm
+# Visi keliai ir parametrai yra config/config.yaml, mėginiai config/samples.tsv.
+
 import csv
 
 configfile: "config/config.yaml"
@@ -15,6 +19,7 @@ wildcard_constraints:
     read = "1|2"
 
 localrules: all
+
 rule all:
     input:
         "results/multiqc/multiqc_report.html",
@@ -37,6 +42,7 @@ rule download_fastq:
     shell:
         """
         mkdir -p {params.tmp}
+        # --split-3: poros lieka sinchronizuotos (_1/_2), pavieniai skaitymai atskirai
         prefetch {wildcards.sample} --max-size 100G -O {params.tmp} > {log} 2>&1
         fasterq-dump {params.tmp}/{wildcards.sample} --split-3 -e {threads} \
             -t {params.tmp} -O {params.tmp} >> {log} 2>&1
@@ -90,8 +96,9 @@ rule fastqc_trimmed:
     threads: 2
     resources: mem_mb = 4000, runtime = 60
     shell: "fastqc -t {threads} -o results/qc/fastqc_trimmed {input} > {log} 2>&1"
-
 rule hisat2_index:
+    # Kuriamas tik vieną kartą: Snakemake jo neperleidžia, jei failai jau yra.
+    # ancient(): genomo failo laiko žyma nesukelia indekso perkūrimo.
     input: ancient(REF["genome"])
     output: multiext(f"{REF['dir']}/hisat2_index/genome", *[f".{i}.ht2" for i in range(1, 9)])
     log: "logs/hisat2_index/hisat2_index.log"
@@ -139,6 +146,7 @@ rule samtools_stats:
         """
 
 rule featurecounts:
+    # Viena lentelė visiems mėginiams (genai x mėginiai)
     input:
         bams = expand("results/aligned/{sample}.bam", sample=SAMPLES),
         gtf = ancient(REF["gtf"]),
@@ -159,6 +167,7 @@ rule featurecounts:
             -t {params.t} -g {params.g} -a {input.gtf} \
             -o {output.table} {input.bams} > {log} 2>&1
         """
+
 rule kallisto_index:
     input: ancient(REF["transcripts"])
     output: f"{REF['dir']}/kallisto/transcripts.idx"
@@ -188,7 +197,10 @@ rule kallisto_quant:
         kallisto quant -i {input.idx} -o results/kallisto/{wildcards.sample} \
             -b {params.b} -t {threads} {params.strand} {input.r1} {input.r2} > {log} 2>&1
         """
+
 rule gtf_to_bed:
+    # RSeQC reikia BED12. Antras BED (tik protein-coding Ensembl_canonical
+    # transkriptai) naudojamas gene body coverage, kad skaičiavimas būtų greitesnis.
     input: ancient(REF["gtf"])
     output:
         bed = f"{REF['dir']}/annotation.bed12",
@@ -329,7 +341,6 @@ rule deeptools_fragment_size:
         bamPEFragmentSize -b {input.bams} --samplesLabel {params.labels} -p {threads} \
             --histogram {output.png} --table {output.table} > {log} 2>&1
         """
-
 rule multiqc:
     input:
         expand("results/qc/fastqc_raw/{sample}_{read}_fastqc.zip", sample=SAMPLES, read=[1, 2]),
@@ -344,8 +355,18 @@ rule multiqc:
         "results/deeptools/correlation_matrix.tab",
         "results/deeptools/pca_data.tab",
         "results/deeptools/fragment_size.tab",
+        mqc_config = "config/multiqc_config.yaml",
+        images = ["results/deeptools/correlation_heatmap.png", "results/deeptools/pca.png"],
     output: "results/multiqc/multiqc_report.html"
     log: "logs/multiqc/multiqc.log"
     conda: "envs/multiqc.yaml"
     resources: mem_mb = 8000, runtime = 60
-    shell: "multiqc -f -o results/multiqc results logs > {log} 2>&1"
+    params: img_dir = "results/multiqc_images"
+    shell:
+        """
+        # deepTools koreliacijos ir PCA grafikai įtraukiami kaip MultiQC paveikslai (*_mqc.png)
+        mkdir -p {params.img_dir}
+        for f in {input.images}; do cp "$f" {params.img_dir}/deeptools_$(basename "$f" .png)_mqc.png; done
+        multiqc -f -c {input.mqc_config} -o results/multiqc results logs > {log} 2>&1
+        """
+

@@ -1,0 +1,15 @@
+title: "HW3 RNA-seq (GSE52778)"
+top_modules:
+  - fastqc:
+      name: "FastQC (raw)"
+      anchor: "fastqc_raw"
+      path_filters:
+        - "*fastqc_raw/*"
+  - fastp
+  - fastqc:
+      name: "FastQC (trimmed)"
+      anchor: "fastqc_trimmed"
+      path_filters:
+        - "*fastqc_trimmed/*"
+extra_fn_clean_exts:
+  - ".trimmed"
