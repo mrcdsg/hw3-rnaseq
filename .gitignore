@@ -8,3 +8,4 @@ logs/
 *.sam
 *.fastq*
 *.fq*
+igv/
