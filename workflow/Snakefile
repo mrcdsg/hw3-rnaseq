@@ -367,6 +367,6 @@ rule multiqc:
         # deepTools koreliacijos ir PCA grafikai įtraukiami kaip MultiQC paveikslai (*_mqc.png)
         mkdir -p {params.img_dir}
         for f in {input.images}; do cp "$f" {params.img_dir}/deeptools_$(basename "$f" .png)_mqc.png; done
-        multiqc -f -c {input.mqc_config} -o results/multiqc results logs > {log} 2>&1
+        multiqc -f -c {input.mqc_config} -n multiqc_report.html -o results/multiqc results logs > {log} 2>&1
         """
 
